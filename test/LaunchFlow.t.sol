@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/IERC6093.sol";
 import {PoolManager} from "v4-core/src/PoolManager.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
@@ -394,5 +395,51 @@ contract LaunchFlowTest is Test {
         assertEq(token.totalSupply(), supplyBefore - burned);
         trader.swap(key, false, -int256(received));
         assertEq(token.balanceOf(address(trader)), 0);
+    }
+
+    function test_sellAboveBalanceRollsBackTheEarlierEtherPayout() public {
+        _seed();
+        trader.swap(key, true, -1 ether);
+        uint256 held = token.balanceOf(address(trader));
+        bytes32 beforeState = _launchBalances();
+        // The callback takes currency0 (ETH) before paying currency1 (ADVN). A failure
+        // paying the tokens must roll back that earlier ETH payment and every token balance.
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, address(trader), held, held + 1)
+        );
+        trader.swap(key, false, -int256(held + 1));
+        assertEq(_launchBalances(), beforeState);
+        // The failed unlock must not leave the pool unusable or its deltas unsettled.
+        trader.swap(key, false, -int256(held));
+        assertEq(token.balanceOf(address(trader)), 0);
+    }
+
+    function test_unfundedBuyRollsBackAndTheNextFundedBuySucceeds() public {
+        _seed();
+        vm.deal(address(trader), 0);
+        bytes32 beforeState = _launchBalances();
+        // The value-bearing settlement call fails because the trader has no ETH.
+        vm.expectRevert();
+        trader.swap(key, true, -1 ether);
+        assertEq(_launchBalances(), beforeState);
+        vm.deal(address(trader), 1 ether);
+        trader.swap(key, true, -1 ether);
+        assertGt(token.balanceOf(address(trader)), 0);
+        assertEq(address(trader).balance, 0);
+    }
+
+    function _launchBalances() internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                token.totalSupply(),
+                token.balanceOf(address(manager)),
+                token.balanceOf(address(factory)),
+                token.balanceOf(address(trader)),
+                token.balanceOf(JENSEN),
+                token.balanceOf(DISTRIBUTOR),
+                address(trader).balance,
+                address(manager).balance
+            )
+        );
     }
 }
