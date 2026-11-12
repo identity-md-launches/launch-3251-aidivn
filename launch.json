@@ -1,0 +1,28 @@
+{
+  "kind": "custom_token",
+  "token": {
+    "contract": "ADVNToken",
+    "name": "AIDIVN",
+    "symbol": "ADVN",
+    "decimals": 18,
+    "constructorArgs": [
+      "$factory",
+      "$poolManager",
+      "$launchNumber"
+    ],
+    "totalSupply": "1000000000000000000000000000"
+  },
+  "contracts": [],
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "economics": {
+    "poolBps": 8800,
+    "initialMarketCapWei": "10000000000000000000",
+    "remainderTo": "0xd3959c80d11b4d2841fda01de9a0d9b36c52217e"
+  },
+  "notes": "ADVNToken mints 1,000,000,000 AIDIVN (ADVN), with 18 decimals, once to msg.sender in its constructor. It has no owner, further minting, pause, blacklist or upgrade mechanism. Each taxed transfer sends 0.5% of the transferred amount to the requester's designated Jensen Huang address, 0xc59b0c072f73ceea3dc354031165501c0ff25023, and burns 1% of the transferred amount, with each amount rounded down in minor units. Outgoing transfers from the factory or this launch's distributor, resolved through factory.distributorOf(launchNumber), and transfers into the PoolManager are exempt. Buys and liquidity withdrawals from the PoolManager and ordinary wallet transfers are taxed unless an exemption applies; sells into the PoolManager are exempt so settlement remains exact. No application contracts are deployed. The pool uses native ETH and a separate 1.25% pool fee. pool.initialPrice is provenance only; the deployer derives the opening price from economics.initialMarketCapWei and totalSupply. Thank you for all you have done to the industry Jensen!"
+}
