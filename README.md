@@ -41,21 +41,45 @@ the rule, the resolved distributor and the split for an amount.
 The request says "a 0.5% transfered from every trade fee to Jensen Huang ... and a 1% burn of
 supply from every fee". This build applies both to each taxed transfer amount: 0.5% to the named
 address and 1% burned, 1.5% in total. A reading where the burn is 1% of the 0.5% fee (0.005% of
-the amount) seemed too small to be what was meant; if that was intended, `BURN_BPS` is the single
-constant to change. "Trade" is read as any transfer that is not a launch flow; see the limits below.
+the amount, 200 times less deflation) seemed too small to be what was meant; if that was intended,
+`BURN_BPS` is the single constant to change. **The requester should confirm the intended burn base
+before release**: `BURN_BPS` is a constant, so it cannot be changed after deployment. "Trade" is
+read as any transfer that is not a launch flow; see the limits below.
 
 ### Limits the launch imposes on "every trade"
 
+The tax is an ERC-20 transfer tax: it runs only when this contract's `transfer` or `transferFrom`
+is called. Precisely, it applies to **ERC-20 transfers leaving the PoolManager** (`take`) and to
+**ordinary ERC-20 transfers** between any two parties other than the three launch flows. It does
+not and cannot apply to anything that happens inside the Uniswap v4 PoolManager without calling
+the token.
+
 - **Sells into the v4 pool are not taxed.** v4 requires exact settlement, so the only way to tax a
-  sell on-chain would be a Uniswap v4 hook, which this launch kind does not deploy. Buys from the
-  pool are taxed because the PoolManager pays the trader with a plain `transfer`.
-- **Buyers receive 98.5% of the quoted output.** A quoter or router computes the swap output from
-  the pool; the 1.5% is taken on the transfer out of the PoolManager. Routers that check a minimum
-  output against the swap delta still pass; frontends should show the net amount.
-- **Liquidity providers are taxed on withdrawal** (tokens leave the PoolManager), not on deposit.
+  sell on-chain would be a Uniswap v4 hook, which this launch kind does not deploy. A buy that is
+  paid out as ERC-20 is taxed because the PoolManager hands the trader the tokens with a plain
+  `transfer`.
+- **Trades settled as ERC-6909 claims are not taxed.** Uniswap v4 lets any router credit a positive
+  ADVN delta with `PoolManager.mint` (claims) instead of `take`, pay a negative delta with
+  `PoolManager.burn` instead of an ERC-20 transfer in, and move claims between accounts with the
+  PoolManager's own `transfer(receiver, id, amount)`. None of these calls the token, so a buy
+  credited as claims pays no fee and burns nothing, a buy/sell round trip done entirely in claims
+  is untaxed, a claim-to-claim move is untaxed, and ERC-20 holdings can be wrapped into claims
+  untaxed (the transfer into the PoolManager is exempt by the floor). The tax is only deferred for
+  anyone who wants ERC-20 tokens: redeeming claims with `take` is a transfer out of the PoolManager
+  and is taxed. Sophisticated flow (bots, aggregators, custom routers) can therefore trade the
+  launch pool without paying the fee or burning; the tax reliably reaches users whose router takes
+  ERC-20 out of the PoolManager and every ordinary wallet transfer. Charging pool trades regardless
+  of how they settle needs a v4 hook (`afterSwap` taking the ADVN side), which is a separate hook
+  launch and a requester decision, not a change to this token. `test/LaunchFlow.t.sol` pins each of
+  these flows.
+- **Buyers paid in ERC-20 receive 98.5% of the quoted output.** A quoter or router computes the swap
+  output from the pool; the 1.5% is taken on the transfer out of the PoolManager. Routers that check
+  a minimum output against the swap delta still pass; frontends should show the net amount.
+- **Liquidity providers are taxed on withdrawal** (tokens leave the PoolManager as ERC-20), not on
+  deposit.
 - **Transfers through other venues** (a centralised exchange's hot wallet, an OTC transfer, a v2 or
-  v3 pool) are ordinary transfers and are taxed in both directions, since nothing but the three
-  launch flows is exempt.
+  v3 pool) are ordinary ERC-20 transfers and are taxed in both directions, since nothing but the
+  three launch flows is exempt.
 
 ## Interface
 
@@ -106,8 +130,13 @@ remaining 2% to `remainderTo`, all untaxed.
 ## Assumptions
 
 - The factory exposes `distributorOf(uint64) returns (address)` and returns the zero address until
-  the launch's distributor exists. If the call fails or returns fewer than 32 bytes the token
-  treats the distributor as unknown and taxes normally; it never reverts a transfer for that.
+  the launch's distributor exists. If the call fails, returns fewer than 32 bytes, or returns a
+  32-byte word that is not a clean address (any of the top 96 bits set), the token treats the
+  distributor as unknown and taxes normally; it never reverts a transfer for that. The word is
+  decoded as `uint256` and range-checked rather than with `abi.decode(_, (address))`, which would
+  revert on dirty upper bits.
+- `previewTransfer(amount)` is defined for every `uint256`: it divides by 200 and 100 (the exact
+  reciprocals of 50 and 100 basis points) instead of multiplying first, so it cannot overflow.
 - The fee recipient address is taken from the brief as written. It is an externally owned address
   on Ethereum; no code is required there, and nothing here can change it after deployment.
 - There are no other exempt parties: no treasury, team or marketing wallet, no router allow-list.
@@ -119,10 +148,15 @@ remaining 2% to `remainderTo`, all untaxed.
   launch. There is no "After launch" checklist.
 - **The fee recipient** receives ADVN continuously as buys and transfers happen; it needs no action.
 - **Integrators** (frontends, aggregators) should quote the net amount a buyer receives as
-  `previewTransfer(quotedOutput).received` and should know that `transferFrom`-based deposits into
-  contracts other than the PoolManager arrive 1.5% short.
+  `previewTransfer(quotedOutput).received` when the router takes ERC-20 out of the PoolManager, and
+  should know that `transferFrom`-based deposits into contracts other than the PoolManager arrive
+  1.5% short. A router that settles in ERC-6909 claims delivers the gross output as claims; the
+  1.5% is taken when the claims are redeemed as ERC-20.
 - **The requester** should be aware that `totalSupply()` falls over time and that fixed-supply
-  assumptions elsewhere (airdrop maths, vesting contracts) must read the live balance.
+  assumptions elsewhere (airdrop maths, vesting contracts) must read the live balance; that the fee
+  stream and the burn are not collected on pool trades settled as ERC-6909 claims (see the limits
+  above), and that collecting them there needs a Uniswap v4 hook ordered as its own launch; and
+  that the burn base (1% of the transferred amount) should be confirmed before release.
 
 ## Build and test (offline)
 
@@ -142,9 +176,9 @@ OpenZeppelin Contracts 5.7 (ERC20 and its interfaces only), Uniswap v4-core `src
 
 | File | What it checks |
 |---|---|
-| `test/ADVNToken.t.sol` | Metadata, supply, constructor guards, the exempt flows, taxed `transfer`/`transferFrom`, rounding at dust amounts, zero transfers, failure paths (insufficient balance and allowance, zero receiver, no admin entry points, the factory cannot pull a holder's balance), factory lookup robustness (no code, reverting, short answer), fuzz: value conservation, exact exempt flows, bounded tax. |
+| `test/ADVNToken.t.sol` | Metadata, supply, constructor guards, the exempt flows, taxed `transfer`/`transferFrom`, rounding at dust amounts, zero transfers, failure paths (insufficient balance and allowance, zero receiver, no admin entry points, the factory cannot pull a holder's balance), factory lookup robustness (no code, reverting, short answer, a 32-byte word that is not an address), `previewTransfer` at `type(uint256).max`, fuzz: value conservation, exact exempt flows, bounded tax, preview equals the basis-point formula over the whole `uint256` range. |
 | `test/ADVNToken.invariant.t.sol` | Random transfers and transferFroms between the factory, PoolManager, distributor, fee recipient and wallets against an independent ledger: every balance matches, balances sum to the supply, the supply never grows and only burns shrink it. |
-| `test/LaunchFlow.t.sol` | Against a real Uniswap v4 `PoolManager` paired with ETH: the swarm share and a claim move whole, a single-sided seed takes exactly what the pool asks, a trader buys (taxed on the way out) and sells its whole balance back (exact on the way in), repeated round trips never revert, liquidity withdrawal is taxed, and a fuzzed buy size always settles. |
+| `test/LaunchFlow.t.sol` | Against a real Uniswap v4 `PoolManager` paired with ETH: the swarm share and a claim move whole, a single-sided seed takes exactly what the pool asks, a trader buys (taxed on the way out) and sells its whole balance back (exact on the way in), repeated round trips never revert, liquidity withdrawal is taxed, and a fuzzed buy size always settles. ERC-6909 claims, as documented above: a buy credited as claims pays no fee and burns nothing until redeemed as ERC-20 (then taxed), a claim-only round trip is untaxed, a claim-to-claim move is untaxed and the recipient's redemption is taxed, wrapping ERC-20 into claims is untaxed and unwrapping is taxed. |
 
 ## Deploy (operator only)
 

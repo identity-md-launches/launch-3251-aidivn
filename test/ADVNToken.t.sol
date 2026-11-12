@@ -4,7 +4,7 @@ pragma solidity 0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/IERC6093.sol";
 import {ADVNToken} from "../src/ADVNToken.sol";
-import {MockFactory, RevertingFactory, ShortAnswerFactory} from "./mocks/MockFactory.sol";
+import {MalformedAnswerFactory, MockFactory, RevertingFactory, ShortAnswerFactory} from "./mocks/MockFactory.sol";
 
 contract ADVNTokenTest is Test {
     uint256 constant SUPPLY = 1_000_000_000 * 1e18;
@@ -58,6 +58,9 @@ contract ADVNTokenTest is Test {
         assertEq(token.FEE_BPS(), 50);
         assertEq(token.BURN_BPS(), 100);
         assertEq(token.BPS_DENOMINATOR(), 10_000);
+        // `previewTransfer` divides by the reciprocals, which is exact only because these hold.
+        assertEq(token.BPS_DENOMINATOR() % token.FEE_BPS(), 0);
+        assertEq(token.BPS_DENOMINATOR() % token.BURN_BPS(), 0);
     }
 
     function test_constructorRejectsZeroFactory() public {
@@ -349,6 +352,49 @@ contract ADVNTokenTest is Test {
         vm.prank(alice);
         fresh.transfer(bob, 1_000e18);
         assertEq(fresh.balanceOf(bob), 985e18);
+    }
+
+    function test_transfersWorkWhenTheFactoryAnswersANonAddressWord() public {
+        MalformedAnswerFactory malformed = new MalformedAnswerFactory();
+        ADVNToken fresh = malformed.deployToken(POOL_MANAGER, LAUNCH_NUMBER);
+        assertEq(fresh.distributor(), address(0), "a word with upper bits set is not a distributor");
+        assertFalse(fresh.isExempt(alice, bob));
+        malformed.move(fresh, alice, 1_000e18);
+        vm.prank(alice);
+        assertTrue(fresh.transfer(bob, 200));
+        assertEq(fresh.balanceOf(bob), 197, "an ordinary transfer is taxed, not frozen");
+        assertEq(fresh.balanceOf(JENSEN), 1);
+        assertEq(fresh.totalSupply(), SUPPLY - 2);
+        // A buy (tokens leaving the PoolManager) keeps working too.
+        vm.prank(alice);
+        fresh.transfer(POOL_MANAGER, 1_000e18 - 200);
+        vm.prank(POOL_MANAGER);
+        assertTrue(fresh.transfer(carol, 1_000e18 - 200));
+        assertGt(fresh.balanceOf(carol), 0);
+    }
+
+    function test_previewTransferIsDefinedForEveryAmount() public view {
+        uint256 max = type(uint256).max;
+        (uint256 fee, uint256 burned, uint256 received) = token.previewTransfer(max);
+        assertEq(fee, max / 200);
+        assertEq(burned, max / 100);
+        assertEq(received, max - max / 200 - max / 100);
+        (fee, burned, received) = token.previewTransfer(max / 100 + 1);
+        assertEq(fee, (max / 100 + 1) / 200);
+        assertEq(burned, (max / 100 + 1) / 100);
+        assertEq(fee + burned + received, max / 100 + 1);
+    }
+
+    function testFuzz_previewTransferMatchesTheBasisPointFormula(uint256 amount) public view {
+        (uint256 fee, uint256 burned, uint256 received) = token.previewTransfer(amount);
+        // Same values the basis-point formula gives wherever that formula is defined.
+        if (amount <= type(uint256).max / 100) {
+            assertEq(fee, amount * 50 / 10_000);
+            assertEq(burned, amount * 100 / 10_000);
+        }
+        assertEq(fee, amount / 200);
+        assertEq(burned, amount / 100);
+        assertEq(fee + burned + received, amount);
     }
 
     // ---------------------------------------------------------------- fuzz

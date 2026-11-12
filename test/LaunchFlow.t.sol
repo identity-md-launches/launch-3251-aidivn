@@ -106,6 +106,82 @@ contract TraderProbe is V4Actor {
     constructor(IPoolManager manager_) V4Actor(manager_) {}
 }
 
+/// @notice A trader whose router settles ADVN as ERC-6909 claims inside the PoolManager instead of
+///         ERC-20: buys are credited with `mint`, sells are paid with `burn`, and claims can be moved
+///         with the PoolManager's own `transfer` or redeemed as ERC-20 with `take`. None of these
+///         calls the token, so none of them can be taxed by it.
+contract ClaimTraderProbe is IUnlockCallback {
+    IPoolManager internal immutable manager;
+
+    constructor(IPoolManager manager_) {
+        manager = manager_;
+    }
+
+    receive() external payable {}
+
+    function claimId(PoolKey memory key) public pure returns (uint256) {
+        return uint256(uint160(Currency.unwrap(key.currency1)));
+    }
+
+    /// @dev Exact-input buy of ADVN with `ethIn`, credited as claims. Returns the gross output.
+    function buyAsClaims(PoolKey calldata key, uint256 ethIn) external returns (uint256) {
+        return abi.decode(manager.unlock(abi.encode(uint8(0), abi.encode(key, ethIn))), (uint256));
+    }
+
+    /// @dev Exact-input sell of `amount` ADVN paid from claims; the ETH is taken as native.
+    function sellFromClaims(PoolKey calldata key, uint256 amount) external returns (uint256) {
+        return abi.decode(manager.unlock(abi.encode(uint8(1), abi.encode(key, amount))), (uint256));
+    }
+
+    /// @dev Burn `amount` of claims and take the ERC-20 out of the PoolManager to `to`.
+    function redeemClaims(PoolKey calldata key, address to, uint256 amount) external {
+        manager.unlock(abi.encode(uint8(2), abi.encode(key, to, amount)));
+    }
+
+    /// @dev Move claims to another account without leaving the PoolManager.
+    function moveClaims(PoolKey calldata key, address to, uint256 amount) external returns (bool) {
+        return manager.transfer(to, claimId(key), amount);
+    }
+
+    /// @dev Wrap ERC-20 held here into claims: sync, transfer in (exempt), settle, mint.
+    function wrapIntoClaims(PoolKey calldata key, uint256 amount) external {
+        manager.unlock(abi.encode(uint8(3), abi.encode(key, amount)));
+    }
+
+    function unlockCallback(bytes calldata data) external override returns (bytes memory) {
+        require(msg.sender == address(manager), "not the pool manager");
+        (uint8 kind, bytes memory inner) = abi.decode(data, (uint8, bytes));
+        if (kind == 0) {
+            (PoolKey memory key, uint256 ethIn) = abi.decode(inner, (PoolKey, uint256));
+            BalanceDelta delta = manager.swap(key, SwapParams(true, -int256(ethIn), TickMath.MIN_SQRT_PRICE + 1), "");
+            manager.settle{value: uint256(uint128(-delta.amount0()))}();
+            uint256 gross = uint256(uint128(delta.amount1()));
+            manager.mint(address(this), claimId(key), gross);
+            return abi.encode(gross);
+        }
+        if (kind == 1) {
+            (PoolKey memory key, uint256 amount) = abi.decode(inner, (PoolKey, uint256));
+            BalanceDelta delta = manager.swap(key, SwapParams(false, -int256(amount), TickMath.MAX_SQRT_PRICE - 1), "");
+            manager.burn(address(this), claimId(key), amount);
+            uint256 ethOut = uint256(uint128(delta.amount0()));
+            manager.take(key.currency0, address(this), ethOut);
+            return abi.encode(ethOut);
+        }
+        if (kind == 2) {
+            (PoolKey memory k, address to, uint256 redeemed) = abi.decode(inner, (PoolKey, address, uint256));
+            manager.burn(address(this), claimId(k), redeemed);
+            manager.take(k.currency1, to, redeemed);
+            return "";
+        }
+        (PoolKey memory wk, uint256 wrapped) = abi.decode(inner, (PoolKey, uint256));
+        manager.sync(wk.currency1);
+        require(IERC20(Currency.unwrap(wk.currency1)).transfer(address(manager), wrapped), "transfer failed");
+        manager.settle();
+        manager.mint(address(this), claimId(wk), wrapped);
+        return "";
+    }
+}
+
 /// @notice The launch flows against a real Uniswap v4 PoolManager paired with native ETH: the swarm
 ///         share and claims move whole, the seed takes exactly what it says, a trader buys (taxed on
 ///         the way out of the pool) and sells everything back (untaxed into the pool).
@@ -216,6 +292,94 @@ contract LaunchFlowTest is Test {
         }
         assertLt(token.totalSupply(), SUPPLY, "buys burned supply");
         assertGt(token.balanceOf(JENSEN), 0, "buys paid Jensen");
+    }
+
+    // ------------------------------------------------------------ ERC-6909 claims (documented limit)
+
+    /// @dev Records the limit the README states: a buy settled as claims pays no fee and burns
+    ///      nothing, because nothing calls the token. The tax is only deferred for anyone who wants
+    ///      ERC-20 tokens: redeeming the claims with `take` is a transfer out of the PoolManager.
+    function test_buySettledAsClaimsIsUntaxedUntilRedeemedAsErc20() public {
+        _seed();
+        ClaimTraderProbe claimer = new ClaimTraderProbe(manager);
+        vm.deal(address(claimer), 10 ether);
+        uint256 supplyBefore = token.totalSupply();
+        uint256 poolBefore = token.balanceOf(address(manager));
+
+        uint256 gross = claimer.buyAsClaims(key, 1 ether);
+        assertGt(gross, 0);
+        assertEq(manager.balanceOf(address(claimer), claimer.claimId(key)), gross, "the whole output is claims");
+        assertEq(token.balanceOf(address(claimer)), 0, "no ERC-20 moved");
+        assertEq(token.balanceOf(address(manager)), poolBefore, "the PoolManager still holds the tokens");
+        assertEq(token.balanceOf(JENSEN), 0, "a claim-settled buy pays no fee");
+        assertEq(token.totalSupply(), supplyBefore, "a claim-settled buy burns nothing");
+
+        // Redeeming the claims as ERC-20 is a transfer out of the PoolManager and is taxed.
+        claimer.redeemClaims(key, address(claimer), gross);
+        (uint256 fee, uint256 burned, uint256 received) = token.previewTransfer(gross);
+        assertEq(manager.balanceOf(address(claimer), claimer.claimId(key)), 0);
+        assertEq(token.balanceOf(address(claimer)), received, "the redeemed tokens are taxed on the way out");
+        assertEq(token.balanceOf(JENSEN), fee);
+        assertEq(token.totalSupply(), supplyBefore - burned);
+    }
+
+    /// @dev A full round trip settled as claims never touches the token: untaxed in both directions.
+    function test_claimRoundTripIsUntaxed() public {
+        _seed();
+        ClaimTraderProbe claimer = new ClaimTraderProbe(manager);
+        vm.deal(address(claimer), 10 ether);
+        uint256 supplyBefore = token.totalSupply();
+        uint256 gross = claimer.buyAsClaims(key, 1 ether);
+        uint256 ethOut = claimer.sellFromClaims(key, gross);
+        assertGt(ethOut, 0);
+        assertEq(manager.balanceOf(address(claimer), claimer.claimId(key)), 0);
+        assertEq(token.balanceOf(JENSEN), 0, "nothing in the round trip called the token");
+        assertEq(token.totalSupply(), supplyBefore);
+    }
+
+    /// @dev Claims move between accounts through the PoolManager's own ERC-6909 `transfer`, untaxed;
+    ///      the recipient pays the tax when it redeems them as ERC-20.
+    function test_claimToClaimMoveIsUntaxedAndRedemptionIsTaxed() public {
+        _seed();
+        ClaimTraderProbe claimer = new ClaimTraderProbe(manager);
+        ClaimTraderProbe bob = new ClaimTraderProbe(manager);
+        vm.deal(address(claimer), 10 ether);
+        uint256 supplyBefore = token.totalSupply();
+        uint256 gross = claimer.buyAsClaims(key, 1 ether);
+
+        assertTrue(claimer.moveClaims(key, address(bob), gross));
+        assertEq(manager.balanceOf(address(bob), claimer.claimId(key)), gross, "bob holds the full amount as claims");
+        assertEq(token.balanceOf(JENSEN), 0, "a claim-to-claim move pays no fee");
+        assertEq(token.totalSupply(), supplyBefore);
+
+        bob.redeemClaims(key, address(bob), gross);
+        (uint256 fee, uint256 burned, uint256 received) = token.previewTransfer(gross);
+        assertEq(token.balanceOf(address(bob)), received);
+        assertEq(token.balanceOf(JENSEN), fee);
+        assertEq(token.totalSupply(), supplyBefore - burned);
+    }
+
+    /// @dev ERC-20 holdings can be wrapped into claims untaxed (the transfer into the PoolManager is
+    ///      exempt by the floor) and unwrapped taxed, so wrapping is never a way to keep tokens
+    ///      ERC-20-usable without paying.
+    function test_wrappingErc20IntoClaimsIsUntaxedAndUnwrappingIsTaxed() public {
+        _seed();
+        ClaimTraderProbe claimer = new ClaimTraderProbe(manager);
+        uint256 amount = 1_000e18;
+        assertTrue(factory.move(token, address(claimer), amount));
+        uint256 supplyBefore = token.totalSupply();
+
+        claimer.wrapIntoClaims(key, amount);
+        assertEq(manager.balanceOf(address(claimer), claimer.claimId(key)), amount, "wrapped whole");
+        assertEq(token.balanceOf(address(claimer)), 0);
+        assertEq(token.balanceOf(JENSEN), 0);
+        assertEq(token.totalSupply(), supplyBefore);
+
+        claimer.redeemClaims(key, address(claimer), amount);
+        (uint256 fee, uint256 burned, uint256 received) = token.previewTransfer(amount);
+        assertEq(token.balanceOf(address(claimer)), received, "unwrapping is taxed");
+        assertEq(token.balanceOf(JENSEN), fee);
+        assertEq(token.totalSupply(), supplyBefore - burned);
     }
 
     function testFuzz_anyBuySizeSettlesAndTaxes(uint256 ethIn) public {

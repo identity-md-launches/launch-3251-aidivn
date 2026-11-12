@@ -19,6 +19,12 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 ///            here would make every sell revert.
 ///      - Everything else is taxed, including tokens leaving the PoolManager (a buy from the launch
 ///        pool, or an LP withdrawal) and wallet-to-wallet transfers.
+///      - The tax is an ERC-20 transfer tax, so it can only run when this contract is called.
+///        Uniswap v4 lets a trader settle a swap as ERC-6909 claims inside the PoolManager
+///        (`mint`/`burn`) and move claims with the PoolManager's own `transfer`; none of that calls
+///        this token, so value held or traded as claims is untaxed until it leaves the PoolManager
+///        as ERC-20 (`take`), which is taxed like any other transfer out. Taxing pool trades
+///        regardless of settlement would need a v4 hook, which this launch kind does not deploy.
 ///      No stored state is ever changed except ERC-20 balances, allowances and the total supply.
 contract ADVNToken is ERC20 {
     /// @notice Where the 0.5% trade fee goes (Jensen Huang, as the requester named it).
@@ -63,12 +69,18 @@ contract ADVNToken is ERC20 {
     }
 
     /// @notice The launch's MerkleDistributor as the factory reports it, or the zero address when
-    ///         the factory has no code, reverts, or has not recorded one yet.
+    ///         the factory has no code, reverts, answers short, or answers a word that is not an
+    ///         address, or has not recorded one yet. This lookup never reverts a transfer.
     function distributor() public view returns (address) {
         (bool ok, bytes memory data) =
             FACTORY.staticcall(abi.encodeWithSignature("distributorOf(uint64)", LAUNCH_NUMBER));
         if (!ok || data.length < 32) return address(0);
-        return abi.decode(data, (address));
+        // Decoded as a word, not an address: `abi.decode(data, (address))` reverts on dirty upper bits.
+        uint256 word = abi.decode(data, (uint256));
+        if (word > type(uint160).max) return address(0);
+        // Casting to uint160 is safe: the line above returned for every word with higher bits set.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return address(uint160(word));
     }
 
     /// @notice Whether a transfer from `from` to `to` is one of the launch flows that move exactly
@@ -80,9 +92,12 @@ contract ADVNToken is ERC20 {
     }
 
     /// @notice The fee and burn a taxed transfer of `amount` would take, and what the recipient gets.
+    /// @dev Divides by the whole-number reciprocals (200 and 100) so the result is defined for every
+    ///      uint256; `amount * FEE_BPS / BPS_DENOMINATOR` gives the same values but overflows above
+    ///      2^256 / 100. Both rates divide the denominator exactly (10_000 / 50 and 10_000 / 100).
     function previewTransfer(uint256 amount) public pure returns (uint256 fee, uint256 burned, uint256 received) {
-        fee = amount * FEE_BPS / BPS_DENOMINATOR;
-        burned = amount * BURN_BPS / BPS_DENOMINATOR;
+        fee = amount / (BPS_DENOMINATOR / FEE_BPS);
+        burned = amount / (BPS_DENOMINATOR / BURN_BPS);
         received = amount - fee - burned;
     }
 

@@ -54,3 +54,22 @@ contract ShortAnswerFactory {
         return token.transfer(to, amount);
     }
 }
+
+/// @notice A factory whose `distributorOf` returns a full 32-byte word that is not a clean address
+///         (a bit above the low 160 is set). `abi.decode(_, (address))` would revert on it.
+contract MalformedAnswerFactory {
+    function deployToken(address poolManager, uint64 launchNumber) external returns (ADVNToken) {
+        return new ADVNToken(address(this), poolManager, launchNumber);
+    }
+
+    fallback() external {
+        assembly ("memory-safe") {
+            mstore(0, shl(160, 1))
+            return(0, 32)
+        }
+    }
+
+    function move(ADVNToken token, address to, uint256 amount) external returns (bool) {
+        return token.transfer(to, amount);
+    }
+}
