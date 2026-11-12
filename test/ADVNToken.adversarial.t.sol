@@ -371,6 +371,76 @@ contract ADVNTokenAdversarialTest is Test {
         assertEq(token.totalSupply(), SUPPLY - 2);
     }
 
+    /// Regression for the earlier noncanonical-word finding: any 32-byte answer with a bit above the
+    /// low 160 set means "no distributor". Transfers keep working and the registered distributor is
+    /// taxed like anyone else while the answer is malformed; a clean answer restores the exemption.
+    function testFuzz_dirtyDistributorWordNeverFreezesOrExemptsTransfers(uint256 high) public {
+        high = bound(high, 1, type(uint96).max);
+        uint256 word = (high << 160) | uint256(uint160(distributor));
+        bytes memory lookup = abi.encodeWithSignature("distributorOf(uint64)", LAUNCH);
+        _fund(distributor, 400);
+        _fund(alice, 200);
+        vm.mockCall(address(factory), lookup, abi.encode(word));
+        assertEq(token.distributor(), address(0));
+        assertFalse(token.isExempt(distributor, alice));
+        vm.prank(distributor);
+        assertTrue(token.transfer(bob, 200));
+        vm.prank(alice);
+        assertTrue(token.transfer(bob, 200));
+        assertEq(token.balanceOf(bob), 394, "both transfers taxed");
+        assertEq(token.balanceOf(JENSEN), 2);
+        assertEq(token.totalSupply(), SUPPLY - 4);
+        vm.clearMockedCalls();
+        assertEq(token.distributor(), distributor);
+        vm.prank(distributor);
+        assertTrue(token.transfer(bob, 200));
+        assertEq(token.balanceOf(bob), 594, "exemption restored with a clean answer");
+        assertEq(token.totalSupply(), SUPPLY - 4);
+    }
+
+    function test_distributorWordBoundaryAndTrailingData() public {
+        bytes memory lookup = abi.encodeWithSignature("distributorOf(uint64)", LAUNCH);
+        vm.mockCall(address(factory), lookup, abi.encode(uint256(type(uint160).max)));
+        assertEq(token.distributor(), address(type(uint160).max), "largest address is still an address");
+        vm.mockCall(address(factory), lookup, abi.encode(uint256(type(uint160).max) + 1));
+        assertEq(token.distributor(), address(0), "first word above the address range");
+        vm.mockCall(address(factory), lookup, abi.encode(type(uint256).max));
+        assertEq(token.distributor(), address(0));
+        // An over-long answer is read by its first word, as ABI decoding does.
+        vm.mockCall(address(factory), lookup, abi.encode(distributor, type(uint256).max));
+        assertEq(token.distributor(), distributor);
+        vm.mockCall(address(factory), lookup, abi.encode(type(uint256).max, distributor));
+        assertEq(token.distributor(), address(0));
+    }
+
+    /// Regression for the earlier preview-overflow finding: defined over the whole uint256 domain,
+    /// each levy is the floor of its rate, and the three parts always add back to the input.
+    function testFuzz_previewIsTotalAndFloorsOverWholeDomain(uint256 amount) public view {
+        (uint256 fee, uint256 burned, uint256 received) = token.previewTransfer(amount);
+        assertLe(fee * 200, amount);
+        assertLt(amount - fee * 200, 200);
+        assertLe(burned * 100, amount);
+        assertLt(amount - burned * 100, 100);
+        assertEq(fee + burned + received, amount);
+        assertGe(received, amount - amount / 200 - amount / 100);
+    }
+
+    function test_previewEdgeExamplesAboveFormerOverflowPoint() public view {
+        uint256 max = type(uint256).max;
+        uint256[4] memory amounts = [max / 100, max / 100 + 1, max - 1, max];
+        for (uint256 i; i < amounts.length; ++i) {
+            (uint256 fee, uint256 burned, uint256 received) = token.previewTransfer(amounts[i]);
+            assertEq(fee + burned + received, amounts[i]);
+            assertGt(fee, 0);
+            assertApproxEqAbs(fee, burned / 2, 1, "fee is half the burn up to rounding");
+        }
+        (uint256 f, uint256 b, uint256 r) = token.previewTransfer(max);
+        // 2^256 - 1 = 200q + 135 and 100q' + 35.
+        assertEq(max - f * 200, 135);
+        assertEq(max - b * 100, 35);
+        assertEq(r, max - f - b);
+    }
+
     function testFuzz_failedDelegatedSpendIsAtomic(uint256 funded, uint256 excess, bool exempt) public {
         funded = bound(funded, 0, SUPPLY);
         uint256 amount = funded + bound(excess, 1, SUPPLY);

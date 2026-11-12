@@ -58,19 +58,29 @@ one helper call so its transient accounting stays inside one transaction.
 
 ## Findings and reproduction
 
-Two low-severity boundary findings are recorded separately in `.imd-findings.json`,
-with complete self-contained failing Foundry sources. Both were reproduced under
-`test/scratch/` before being stored as proof data:
+The previous round reported two low-severity boundary findings. Both are now fixed in
+`src/ADVNToken.sol`, so no open findings are filed in this revision:
 
-- A noncanonical 32-byte distributor response causes ABI decoding to revert and
-  blocks transfers needing that lookup. This requires a faulty or incompatible
-  factory; the normal ABI-conforming registry cannot produce the invalid word.
-- `previewTransfer(type(uint256).max / 100 + 1)` panics although the three percentage
-  outputs fit. This is outside the reachable supply and does not break ordinary
-  transfers; it concerns the unrestricted public preview's input domain.
+- A noncanonical 32-byte distributor response used to make ABI decoding revert and
+  freeze transfers that needed the lookup. `distributor()` now decodes a word and
+  treats anything above `type(uint160).max` as "no distributor". Regressions:
+  `testFuzz_dirtyDistributorWordNeverFreezesOrExemptsTransfers` sets random nonzero
+  upper bits on the real distributor's address. It checks that transfers go through,
+  that the distributor gets no exemption while the answer is malformed, and that a
+  clean answer restores the exemption.
+  `test_distributorWordBoundaryAndTrailingData` pins `2^160 - 1` versus `2^160` and
+  checks that answers longer than one word are read by their first word.
+- `previewTransfer(type(uint256).max / 100 + 1)` used to panic. It now divides by
+  200 and 100. Regressions: `testFuzz_previewIsTotalAndFloorsOverWholeDomain` runs
+  over every `uint256` and checks that each levy is the floor of its rate and that the
+  parts add up to the input. `test_previewEdgeExamplesAboveFormerOverflowPoint` pins
+  `max / 100`, `max / 100 + 1`, `max - 1` and `max`, including the remainders
+  135 (mod 200) and 35 (mod 100) at `2^256 - 1`.
 
-The passing suite does not assert either failing behavior as correct. Scratch proof
-files are not test dependencies or deliverables.
+The implementation review (`REVIEW.md`, item 6) separately documents that pool
+trades settled as Uniswap v4 ERC-6909 claims bypass the ERC-20 tax, and that the
+burn base needs the requester's confirmation (item 2). This suite does not assert
+either one as intended behaviour beyond what that review already reproduces.
 
 ## Check commands
 
